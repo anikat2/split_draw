@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-const WS_BASE = "ws://localhost:8000/ws";
-const API_BASE = "http://localhost:8000";
+const WS_BASE = "ws://https://split-draw-v9wv.vercel.app//ws";
+const API_BASE = "https://split-draw-v9wv.vercel.app/";
 
 const ROUND_TIME = 60;
 
