@@ -13,7 +13,12 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "https://split-draw.vercel.app/"],
+    allow_origins=[
+        "http://localhost:5173",
+        "https://split-draw.vercel.app",
+        "https://split-draw-v9wv.vercel.app"
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
