@@ -118,6 +118,7 @@ async def ws(websocket: WebSocket, lobby_id: str, user_id: str):
                 lobby.setdefault("votes", {})
                 lobby["votes"].setdefault(msg["target"], {"A": 0, "B": 0})
                 lobby["votes"][msg["target"]][msg["choice"]] += 1
+                await try_broadcast_results(lobby_id)
 
     except WebSocketDisconnect:
         lobby["players"] = [p for p in lobby["players"] if p["id"] != user_id]
@@ -263,6 +264,52 @@ async def inpaint(image_b64: str, prompt: str):
         return None
 
 
+# ---------------- RESULTS ---------------- #
+async def try_broadcast_results(lobby_id: str):
+    lobby = lobbies[lobby_id]
+    players = lobby["players"]
+    votes = lobby.get("votes", {})
+    pair_state = lobby["pair_state"]
+
+    # Check every player has voted (one vote entry per target, total votes = num players)
+    total_votes = sum(v["A"] + v["B"] for v in votes.values())
+    if total_votes < len(players):
+        return
+
+    # Build per-player result: did the majority correctly identify human vs AI?
+    results = []
+    for pid, state in pair_state.items():
+        target_votes = votes.get(pid, {"A": 0, "B": 0})
+        human_img = state.get("human")
+        ai_img = state.get("ai")
+
+        # We need to know which option (A or B) was the human drawing
+        # The server randomised options in start_round3 and didn't store the mapping,
+        # so re-derive it: store human_is_A flag in pair_state during round3 setup
+        human_is_A = state.get("human_is_A")  # set in start_round3 below
+        if human_is_A is None:
+            continue
+
+        human_votes = target_votes["A"] if human_is_A else target_votes["B"]
+        ai_votes    = target_votes["B"] if human_is_A else target_votes["A"]
+        humans_fooled = ai_votes > human_votes
+
+        results.append({
+            "target": pid,
+            "human_votes": human_votes,
+            "ai_votes": ai_votes,
+            "humans_fooled": humans_fooled,
+            "human_img": human_img,
+            "ai_img": ai_img,
+        })
+
+    for p in players:
+        await p["ws"].send_json({
+            "type": "results",
+            "results": results,
+        })
+
+
 # ---------------- ROUND 3 ---------------- #
 async def start_round3(lobby_id: str):
     print("starting round 3")
@@ -286,6 +333,8 @@ async def start_round3(lobby_id: str):
 
         options = [human, ai]
         random.shuffle(options)
+        human_is_A = options[0] is human
+        lobby["pair_state"][pid]["human_is_A"] = human_is_A
 
         await p["ws"].send_json({
             "type": "round3",
