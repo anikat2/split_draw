@@ -206,7 +206,6 @@ function Round1Screen({ gameState, sendWs }) {
     ctx.fillStyle = "rgba(0,0,0,0.08)";
     ctx.font = "11px monospace";
     ctx.textAlign = "center";
-    ctx.fillText("← draw your half here", canvas.width / 4, 24);
   }, []);
 
   const handleSubmit = useCallback(() => {
