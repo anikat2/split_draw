@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import random
 import json
@@ -24,9 +24,6 @@ app.add_middleware(
 )
 
 HF_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
-
-# image-to-image model — takes an image + prompt, returns a completion
-# no mask_image required unlike inpainting models
 HF_MODEL = "black-forest-labs/FLUX.1-schnell"
 
 PROMPTS = [
@@ -45,7 +42,6 @@ lobbies = {}
 @app.get("/new_lobby_code")
 def new_lobby():
     lobby_id = f"{random.randint(0,999999):06d}"
-
     lobbies[lobby_id] = {
         "players": [],
         "pairs": [],
@@ -53,14 +49,14 @@ def new_lobby():
         "round": 0,
         "lock": False
     }
-
+    print(f"[lobby] created {lobby_id}. Active lobbies: {list(lobbies.keys())}")
     return {"lobby_id": lobby_id}
+
 
 @app.get("/test_ai")
 async def test_ai():
     if not HF_API_KEY:
         return {"error": "HF_API_KEY not set"}
-    
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
             f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}",
@@ -77,13 +73,35 @@ async def test_ai():
             "model": HF_MODEL,
             "key_prefix": HF_API_KEY[:8] if HF_API_KEY else None,
         }
-# -- websocket -- #
+
+
+# ---------------- WEBSOCKET ---------------- #
 @app.websocket("/ws/{lobby_id}/{user_id}")
 async def ws(websocket: WebSocket, lobby_id: str, user_id: str):
+    # FIX: auto-create lobby if it's missing (handles server restarts / joining before host)
+    if lobby_id not in lobbies:
+        print(f"[ws] lobby {lobby_id} not found — creating on connect for {user_id}")
+        lobbies[lobby_id] = {
+            "players": [],
+            "pairs": [],
+            "pair_state": {},
+            "round": 0,
+            "lock": False
+        }
+
     await websocket.accept()
 
     lobby = lobbies[lobby_id]
-    lobby["players"].append({"id": user_id, "ws": websocket})
+
+    # FIX: don't add duplicate player if they reconnect
+    existing = next((p for p in lobby["players"] if p["id"] == user_id), None)
+    if existing:
+        existing["ws"] = websocket
+        print(f"[ws] {user_id} reconnected to {lobby_id}")
+    else:
+        lobby["players"].append({"id": user_id, "ws": websocket})
+        print(f"[ws] {user_id} joined {lobby_id}. Players: {[p['id'] for p in lobby['players']]}")
+
     lobby["pair_state"].setdefault(user_id, {})
 
     try:
@@ -105,11 +123,15 @@ async def ws(websocket: WebSocket, lobby_id: str, user_id: str):
 
     except WebSocketDisconnect:
         lobby["players"] = [p for p in lobby["players"] if p["id"] != user_id]
+        print(f"[ws] {user_id} disconnected from {lobby_id}")
 
 
 # ---------------- START GAME ---------------- #
 @app.get("/begin_round/{lobby_id}")
 async def begin(lobby_id: str):
+    if lobby_id not in lobbies:
+        raise HTTPException(status_code=404, detail="Lobby not found")
+
     lobby = lobbies[lobby_id]
     players = lobby["players"]
 
@@ -117,27 +139,26 @@ async def begin(lobby_id: str):
         return {"error": "not enough players"}
 
     lobby["round"] = 1
-
     random.shuffle(players)
-
     lobby["pairs"] = []
     lobby["pair_state"] = {}
 
     for i in range(0, len(players) - 1, 2):
         p1 = players[i]
         p2 = players[i + 1]
-
         lobby["pairs"].append((p1, p2))
-
         lobby["pair_state"][p1["id"]] = {"partner": p2["id"]}
         lobby["pair_state"][p2["id"]] = {"partner": p1["id"]}
 
+    prompt = random.choice(PROMPTS)
     for p in players:
         await p["ws"].send_json({
             "type": "round1",
-            "prompt": random.choice(PROMPTS),
+            "prompt": prompt,
             "instruction": "draw HALF of the image"
         })
+        # store prompt per player so AI can use it later
+        lobby["pair_state"][p["id"]]["prompt"] = prompt
 
     return {"status": "round1_started"}
 
@@ -172,7 +193,6 @@ async def start_round2(lobby_id: str):
     for p in lobby["players"]:
         pid = p["id"]
         partner = lobby["pair_state"][pid]["partner"]
-
         await p["ws"].send_json({
             "type": "round2",
             "partner_half": lobby["pair_state"][partner].get("half"),
@@ -181,31 +201,23 @@ async def start_round2(lobby_id: str):
 
     lobby["round"] = 2
 
-    # Generate AI completions for all players
     for p in lobby["players"]:
         pid = p["id"]
         half = lobby["pair_state"][pid].get("half")
-        prompt = lobby["pair_state"][pid].get("prompt", "draw the other half of this in the same style only in black white background make it look hand drawn")
+        prompt = lobby["pair_state"][pid].get("prompt", "complete this drawing in the same hand-drawn style")
 
         print(f"[AI] generating for {pid}, image present: {bool(half)}")
         ai = await inpaint(half, prompt)
         print(f"[AI] result for {pid}: {'OK' if ai else 'FAILED'}")
-
         lobby["pair_state"][pid]["ai"] = ai
 
-    # AI done — check if humans also submitted, fire round 3 if so
     await try_advance(lobby_id)
 
 
 # ---------------- AI ---------------- #
 async def inpaint(image_b64: str, prompt: str):
-    """
-    Text-to-image via HF serverless inference API.
-    The API expects JSON: {"inputs": "prompt text"}
-    and returns raw image bytes on 200.
-    """
     if not HF_API_KEY:
-        print("[AI] HF_API_KEY not set — check your .env file")
+        print("[AI] HF_API_KEY not set")
         return None
 
     url = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
@@ -221,17 +233,14 @@ async def inpaint(image_b64: str, prompt: str):
                 },
                 json={"inputs": prompt},
             )
-
             print(f"[AI] HF status: {r.status_code}")
-
             if r.status_code != 200:
                 print(f"[AI] HF error: {r.text[:500]}")
                 return None
-
             return base64.b64encode(r.content).decode()
 
     except httpx.TimeoutException:
-        print("[AI] timed out after 120s — model may be cold, try again")
+        print("[AI] timed out after 120s")
         return None
     except Exception as e:
         print(f"[AI] unexpected error: {e}")
@@ -245,14 +254,11 @@ async def start_round3(lobby_id: str):
 
     for p in lobby["players"]:
         pid = p["id"]
-
         human = lobby["pair_state"][pid].get("human")
         ai = lobby["pair_state"][pid].get("ai")
 
         print(f"[round3] {pid}: human={bool(human)} ai={bool(ai)}")
 
-        # Graceful fallback: if AI failed, use the partner's human completion
-        # so the vote can still happen
         if not ai:
             partner_id = lobby["pair_state"][pid].get("partner")
             ai = lobby["pair_state"].get(partner_id, {}).get("human")
