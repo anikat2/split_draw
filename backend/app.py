@@ -204,7 +204,7 @@ async def start_round2(lobby_id: str):
     for p in lobby["players"]:
         pid = p["id"]
         half = lobby["pair_state"][pid].get("half")
-        prompt = lobby["pair_state"][pid].get("prompt", "complete this drawing in the same hand-drawn style")
+        prompt = lobby["pair_state"][pid].get("prompt", "complete this drawing in the same hand-drawn style, only use black and white")
 
         print(f"[AI] generating for {pid}, image present: {bool(half)}")
         ai = await inpaint(half, prompt)
