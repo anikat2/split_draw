@@ -65,7 +65,7 @@ async def test_ai():
                 "X-Wait-For-Model": "true",
                 "X-Use-Cache": "0",
             },
-            json={"inputs": "a cat in space"},
+            json={"inputs": "black and white pencil sketch of a cat in space, hand drawn, monochrome, simple line art, white background"},
         )
         return {
             "status": r.status_code,
@@ -78,7 +78,6 @@ async def test_ai():
 # ---------------- WEBSOCKET ---------------- #
 @app.websocket("/ws/{lobby_id}/{user_id}")
 async def ws(websocket: WebSocket, lobby_id: str, user_id: str):
-    # FIX: auto-create lobby if it's missing (handles server restarts / joining before host)
     if lobby_id not in lobbies:
         print(f"[ws] lobby {lobby_id} not found — creating on connect for {user_id}")
         lobbies[lobby_id] = {
@@ -93,7 +92,6 @@ async def ws(websocket: WebSocket, lobby_id: str, user_id: str):
 
     lobby = lobbies[lobby_id]
 
-    # FIX: don't add duplicate player if they reconnect
     existing = next((p for p in lobby["players"] if p["id"] == user_id), None)
     if existing:
         existing["ws"] = websocket
@@ -157,7 +155,6 @@ async def begin(lobby_id: str):
             "prompt": prompt,
             "instruction": "draw HALF of the image"
         })
-        # store prompt per player so AI can use it later
         lobby["pair_state"][p["id"]]["prompt"] = prompt
 
     return {"status": "round1_started"}
@@ -204,9 +201,17 @@ async def start_round2(lobby_id: str):
     for p in lobby["players"]:
         pid = p["id"]
         half = lobby["pair_state"][pid].get("half")
-        prompt = lobby["pair_state"][pid].get("prompt", "complete this drawing in the same hand-drawn style, only use black and white")
+        base_prompt = lobby["pair_state"][pid].get("prompt", "a simple scene")
 
-        print(f"[AI] generating for {pid}, image present: {bool(half)}")
+        # Strong prompt engineered for FLUX to produce B&W hand-drawn output
+        prompt = (
+            f"black and white pencil sketch of {base_prompt}, "
+            "hand drawn illustration, monochrome ink line art, "
+            "sketchy rough style, white background, no color whatsoever, "
+            "no shading, simple childlike doodle, pencil strokes visible"
+        )
+
+        print(f"[AI] generating for {pid}, prompt: {prompt[:80]}...")
         ai = await inpaint(half, prompt)
         print(f"[AI] result for {pid}: {'OK' if ai else 'FAILED'}")
         lobby["pair_state"][pid]["ai"] = ai
@@ -231,7 +236,18 @@ async def inpaint(image_b64: str, prompt: str):
                     "X-Wait-For-Model": "true",
                     "X-Use-Cache": "0",
                 },
-                json={"inputs": prompt},
+                json={
+                    "inputs": prompt,
+                    "parameters": {
+                        "negative_prompt": (
+                            "color, colorful, photorealistic, photo, realistic, "
+                            "3d render, painting, watercolor, oil painting, "
+                            "detailed shading, gradient, vibrant, saturated"
+                        ),
+                        "num_inference_steps": 4,
+                        "guidance_scale": 0.0,
+                    }
+                },
             )
             print(f"[AI] HF status: {r.status_code}")
             if r.status_code != 200:
