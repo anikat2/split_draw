@@ -21,7 +21,6 @@ export default function App() {
   const [connecting, setConnecting] = useState(false);
   const wsRef = useRef(null);
 
-  // Returns a promise that resolves when the WS is open, or rejects on error
   const connectWs = useCallback((lid, uid) => {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(`${WS_BASE}/${lid}/${uid}`);
@@ -35,13 +34,25 @@ export default function App() {
       ws.onmessage = (e) => {
         const msg = JSON.parse(e.data);
         if (msg.type === "round1") {
-          setGameState({ phase: "round1", prompt: msg.prompt, instruction: msg.instruction });
+          setGameState({ phase: "round1", prompt: msg.prompt, instruction: msg.instruction, isBye: msg.is_bye });
           setScreen("round1");
         } else if (msg.type === "round2") {
           setGameState(prev => ({ ...prev, phase: "round2", partnerHalf: msg.partner_half, instruction: msg.instruction }));
           setScreen("round2");
+        } else if (msg.type === "round2_bye") {
+          // Odd player out — show a waiting screen
+          setGameState(prev => ({ ...prev, phase: "round2_bye", instruction: msg.instruction }));
+          setScreen("round2_bye");
         } else if (msg.type === "round3") {
-          setGameState(prev => ({ ...prev, phase: "round3", optionA: msg.A, optionB: msg.B, target: msg.target }));
+          setGameState(prev => ({
+            ...prev,
+            phase: "round3",
+            optionA: msg.A,
+            optionB: msg.B,
+            target: msg.target,
+            isBye: msg.is_bye,
+            byePrompt: msg.bye_prompt,
+          }));
           setScreen("round3");
         } else if (msg.type === "results") {
           setGameState(prev => ({ ...prev, phase: "results", results: msg.results }));
@@ -56,7 +67,6 @@ export default function App() {
       };
 
       ws.onclose = (e) => {
-        // Don't show disconnect error if we never successfully opened
         if (e.code !== 1000 && screen !== "home") {
           setError("Disconnected — refresh to reconnect");
         }
@@ -113,12 +123,13 @@ export default function App() {
   return (
     <div style={styles.root}>
       <div style={styles.grain} />
-      {screen === "home" && <HomeScreen onCreate={createLobby} onJoin={joinLobby} joinInput={joinInput} setJoinInput={setJoinInput} error={error} connecting={connecting} />}
-      {screen === "lobby" && <LobbyScreen lobbyId={lobbyId} userId={userId} onStart={startGame} />}
-      {screen === "round1" && <Round1Screen gameState={gameState} sendWs={sendWs} />}
-      {screen === "round2" && <Round2Screen gameState={gameState} sendWs={sendWs} />}
-      {screen === "round3" && <Round3Screen gameState={gameState} sendWs={sendWs} userId={userId} />}
-      {screen === "results" && <ResultsScreen gameState={gameState} />}
+      {screen === "home"      && <HomeScreen onCreate={createLobby} onJoin={joinLobby} joinInput={joinInput} setJoinInput={setJoinInput} error={error} connecting={connecting} />}
+      {screen === "lobby"     && <LobbyScreen lobbyId={lobbyId} userId={userId} onStart={startGame} />}
+      {screen === "round1"    && <Round1Screen gameState={gameState} sendWs={sendWs} />}
+      {screen === "round2"    && <Round2Screen gameState={gameState} sendWs={sendWs} />}
+      {screen === "round2_bye"&& <Round2ByeScreen gameState={gameState} />}
+      {screen === "round3"    && <Round3Screen gameState={gameState} sendWs={sendWs} userId={userId} />}
+      {screen === "results"   && <ResultsScreen gameState={gameState} />}
     </div>
   );
 }
@@ -261,6 +272,11 @@ function Round1Screen({ gameState, sendWs }) {
         <div style={styles.prompt}>"{gameState?.prompt}"</div>
         <div style={{...styles.timer, color: timerColor}}>{timeLeft}s</div>
       </div>
+      {gameState?.isBye && (
+        <div style={styles.byeNotice}>
+          ⚠ odd player out — you'll draw solo this round and vote on two AI completions later
+        </div>
+      )}
       <p style={styles.instruction}>draw an image that aligns with the prompt, your partner will add to it</p>
       <div style={styles.canvasWrapper}>
         <canvas ref={canvasRef} width={600} height={400} style={styles.canvas}
@@ -392,7 +408,25 @@ function Round2Screen({ gameState, sendWs }) {
   );
 }
 
-// eslint-disable-next-line no-unused-vars
+// Shown to the odd-player-out during round 2
+function Round2ByeScreen({ gameState }) {
+  return (
+    <div style={styles.centerPage}>
+      <div style={styles.homeCard}>
+        <div style={styles.logoMark}>⏳</div>
+        <h2 style={{...styles.title, fontSize: "22px"}}>Hang tight…</h2>
+        <p style={styles.subtitle}>
+          {gameState?.instruction || "You're the odd one out this round — others are drawing. You'll vote soon!"}
+        </p>
+        <div style={styles.divider} />
+        <p style={{...styles.subtitle, color: "#e9c46a", fontSize: "12px"}}>
+          Two AI completions of your sketch are being generated for you to judge.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function Round3Screen({ gameState, sendWs, userId }) {
   const [voted, setVoted] = useState(null);
   const [timeLeft, setTimeLeft] = useState(30);
@@ -422,28 +456,40 @@ function Round3Screen({ gameState, sendWs, userId }) {
   }
 
   const timerColor = timeLeft < 10 ? "#e63946" : timeLeft < 20 ? "#f4a261" : "#8338ec";
+  const isBye = gameState?.isBye;
 
   return (
     <div style={styles.gamePage}>
       <div style={styles.gameHeader}>
         <div style={{...styles.roundBadge, background: "#8338ec"}}>ROUND 3</div>
-        <div style={styles.prompt}>which completion is more creative?</div>
+        <div style={styles.prompt}>
+          {isBye
+            ? (gameState.byePrompt || "Which AI drawing do you prefer?")
+            : "which completion is more creative?"}
+        </div>
         <div style={{...styles.timer, color: timerColor}}>{voted ? "" : `${timeLeft}s`}</div>
       </div>
-      <p style={styles.instruction}>one was drawn by your partner · one was generated by AI · which is more creative?</p>
+      <p style={styles.instruction}>
+        {isBye
+          ? "you were the odd one out — both images were made by AI from your sketch · pick your favourite"
+          : "one was drawn by your partner · one was generated by AI · which is more creative?"}
+      </p>
       <div style={styles.voteGrid}>
         <VoteCard label="A" image={gameState?.optionA} chosen={voted === "A"} disabled={!!voted} onVote={() => vote("A")} />
         <VoteCard label="B" image={gameState?.optionB} chosen={voted === "B"} disabled={!!voted} onVote={() => vote("B")} />
       </div>
-      {voted && <div style={styles.votedBanner}>voted {voted} — waiting for others…</div>}
+      {voted && <div style={styles.votedBanner}>{isBye ? `picked ${voted}` : `voted ${voted}`} — waiting for others…</div>}
     </div>
   );
 }
 
 function ResultsScreen({ gameState }) {
   const results = gameState?.results ?? [];
-  const totalHumanVotes = results.reduce((s, r) => s + r.human_votes, 0);
-  const totalAiVotes    = results.reduce((s, r) => s + r.ai_votes, 0);
+  const pairedResults = results.filter(r => !r.is_bye);
+  const byeResults = results.filter(r => r.is_bye);
+
+  const totalHumanVotes = pairedResults.reduce((s, r) => s + r.human_votes, 0);
+  const totalAiVotes    = pairedResults.reduce((s, r) => s + r.ai_votes, 0);
   const aiWon = totalAiVotes > totalHumanVotes;
 
   return (
@@ -451,22 +497,26 @@ function ResultsScreen({ gameState }) {
       <div style={styles.gameHeader}>
         <div style={{...styles.roundBadge, background: "#e63946"}}>RESULTS</div>
         <div style={styles.prompt}>
-          {aiWon ? "AI fooled the crowd 🤖" : "humans spotted the AI 👁"}
+          {pairedResults.length > 0
+            ? (aiWon ? "AI fooled the crowd 🤖" : "humans spotted the AI 👁")
+            : "all AI this round"}
         </div>
       </div>
 
-      <div style={styles.scoreBanner}>
-        <div style={styles.scoreBlock}>
-          <div style={styles.scoreNum}>{totalHumanVotes}</div>
-          <div style={styles.scoreLabel}>voted human</div>
+      {pairedResults.length > 0 && (
+        <div style={styles.scoreBanner}>
+          <div style={styles.scoreBlock}>
+            <div style={styles.scoreNum}>{totalHumanVotes}</div>
+            <div style={styles.scoreLabel}>voted human</div>
+          </div>
+          <div style={{...styles.scoreBlock, color: "#e63946"}}>
+            <div style={styles.scoreNum}>{totalAiVotes}</div>
+            <div style={styles.scoreLabel}>voted AI</div>
+          </div>
         </div>
-        <div style={{...styles.scoreBlock, color: "#e63946"}}>
-          <div style={styles.scoreNum}>{totalAiVotes}</div>
-          <div style={styles.scoreLabel}>voted AI</div>
-        </div>
-      </div>
+      )}
 
-      {results.map((r, i) => (
+      {pairedResults.map((r, i) => (
         <div key={r.target} style={styles.resultCard}>
           <div style={styles.resultHeader}>
             drawing {i + 1} ·{" "}
@@ -488,6 +538,25 @@ function ResultsScreen({ gameState }) {
               <div style={{...styles.resultImgLabel, color: "#e63946"}}>AI completion</div>
               {r.ai_img
                 ? <img src={`data:image/png;base64,${r.ai_img}`} alt="AI" style={styles.resultImg} />
+                : <div style={styles.voteImgPlaceholder}>—</div>}
+            </div>
+          </div>
+        </div>
+      ))}
+
+      {byeResults.map((r) => (
+        <div key={r.target} style={{...styles.resultCard, borderColor: "#8338ec44"}}>
+          <div style={styles.resultHeader}>
+            <span style={{color: "#8338ec"}}>odd one out · AI vs AI vote</span>
+            <span style={styles.resultVotes}>
+              {r.human_votes}v option A · {r.ai_votes}v option B
+            </span>
+          </div>
+          <div style={styles.resultImgRow}>
+            <div style={styles.resultImgBlock}>
+              <div style={{...styles.resultImgLabel, color: "#8338ec"}}>AI version A</div>
+              {r.ai_img
+                ? <img src={`data:image/png;base64,${r.ai_img}`} alt="AI A" style={styles.resultImg} />
                 : <div style={styles.voteImgPlaceholder}>—</div>}
             </div>
           </div>
@@ -537,6 +606,7 @@ const styles = {
   prompt: { flex: 1, fontSize: "15px", color: "#f9f5f0", fontStyle: "italic", fontFamily: "'Courier New', Courier, monospace" },
   timer: { fontSize: "22px", fontWeight: "700", fontFamily: "'Courier New', Courier, monospace", minWidth: "44px", textAlign: "right" },
   instruction: { fontSize: "12px", color: "#777", textAlign: "center", margin: 0, maxWidth: "500px", fontFamily: "'Courier New', Courier, monospace" },
+  byeNotice: { fontSize: "12px", color: "#e9c46a", border: "1px solid #e9c46a44", borderRadius: "2px", padding: "8px 16px", maxWidth: "500px", textAlign: "center", fontFamily: "'Courier New', Courier, monospace" },
   canvasWrapper: { width: "100%", maxWidth: "660px", border: "1px solid #333", borderRadius: "2px", overflow: "hidden", lineHeight: 0 },
   canvas: { width: "100%", height: "auto", display: "block", touchAction: "none", cursor: "crosshair", background: "#f9f5f0" },
   toolbar: { width: "100%", maxWidth: "660px", background: "#1a1916", border: "1px solid #333", borderRadius: "2px", padding: "0.75rem 1rem", display: "flex", flexDirection: "column", gap: "0.5rem" },

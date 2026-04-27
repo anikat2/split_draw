@@ -141,6 +141,7 @@ async def begin(lobby_id: str):
     random.shuffle(players)
     lobby["pairs"] = []
     lobby["pair_state"] = {}
+    lobby["bye_player"] = None  # Track the odd-one-out player
 
     for i in range(0, len(players) - 1, 2):
         p1 = players[i]
@@ -149,14 +150,24 @@ async def begin(lobby_id: str):
         lobby["pair_state"][p1["id"]] = {"partner": p2["id"]}
         lobby["pair_state"][p2["id"]] = {"partner": p1["id"]}
 
+    # Handle odd player: give them a "bye" — solo round where AI does both halves
+    if len(players) % 2 == 1:
+        bye = players[-1]
+        lobby["bye_player"] = bye["id"]
+        lobby["pair_state"][bye["id"]] = {"partner": None, "is_bye": True}
+        print(f"[lobby] odd player count — {bye['id']} gets a bye (solo AI round)")
+
     prompt = random.choice(PROMPTS)
     for p in players:
+        pid = p["id"]
+        is_bye = lobby["pair_state"][pid].get("is_bye", False)
         await p["ws"].send_json({
             "type": "round1",
             "prompt": prompt,
-            "instruction": "draw HALF of the image"
+            "instruction": "draw HALF of the image",
+            "is_bye": is_bye,  # Client can show a note if desired
         })
-        lobby["pair_state"][p["id"]]["prompt"] = prompt
+        lobby["pair_state"][pid]["prompt"] = prompt
 
     return {"status": "round1_started"}
 
@@ -172,11 +183,42 @@ async def try_advance(lobby_id: str):
 
     try:
         if lobby["round"] == 1:
-            if all("half" in p for p in lobby["pair_state"].values()):
+            # Bye player has no partner, so their "half" counts immediately.
+            # We only wait for paired players to submit halves.
+            paired_ids = set()
+            for p1, p2 in lobby["pairs"]:
+                paired_ids.add(p1["id"])
+                paired_ids.add(p2["id"])
+
+            paired_ready = all(
+                "half" in lobby["pair_state"].get(pid, {})
+                for pid in paired_ids
+            )
+
+            # Bye player: treat as ready once they submit their half (or skip waiting for them)
+            bye_id = lobby.get("bye_player")
+            bye_ready = (
+                bye_id is None or
+                "half" in lobby["pair_state"].get(bye_id, {})
+            )
+
+            if paired_ready and bye_ready:
                 await start_round2(lobby_id)
 
         elif lobby["round"] == 2:
-            if all("human" in p for p in lobby["pair_state"].values()):
+            # Only wait for paired players to submit completions.
+            # Bye player skips round 2 (they get an AI-vs-AI vote in round 3).
+            paired_ids = set()
+            for p1, p2 in lobby["pairs"]:
+                paired_ids.add(p1["id"])
+                paired_ids.add(p2["id"])
+
+            paired_ready = all(
+                "human" in lobby["pair_state"].get(pid, {})
+                for pid in paired_ids
+            )
+
+            if paired_ready:
                 await start_round3(lobby_id)
                 lobby["round"] = 3
 
@@ -187,30 +229,50 @@ async def try_advance(lobby_id: str):
 # ---------------- ROUND 2 ---------------- #
 async def start_round2(lobby_id: str):
     lobby = lobbies[lobby_id]
+    bye_id = lobby.get("bye_player")
 
     for p in lobby["players"]:
         pid = p["id"]
-        partner = lobby["pair_state"][pid]["partner"]
-        await p["ws"].send_json({
-            "type": "round2",
-            "partner_half": lobby["pair_state"][partner].get("half"),
-            "instruction": "complete the drawing"
-        })
+        state = lobby["pair_state"][pid]
+
+        if state.get("is_bye"):
+            # Bye player goes straight to a waiting screen — they skip round 2 drawing
+            await p["ws"].send_json({
+                "type": "round2_bye",
+                "instruction": "Odd player out — sit tight while others complete their drawings!"
+            })
+            # Mark them as having submitted their "human" completion (empty placeholder)
+            # so try_advance doesn't wait on them
+            lobby["pair_state"][pid]["human"] = None
+        else:
+            partner = state["partner"]
+            await p["ws"].send_json({
+                "type": "round2",
+                "partner_half": lobby["pair_state"][partner].get("half"),
+                "instruction": "complete the drawing"
+            })
 
     lobby["round"] = 2
 
+    # Generate AI completions for all players (including bye player using their own half)
     for p in lobby["players"]:
         pid = p["id"]
-        half = lobby["pair_state"][pid].get("half")
-        base_prompt = lobby["pair_state"][pid].get("prompt", "a simple scene")
+        state = lobby["pair_state"][pid]
+        base_prompt = state.get("prompt", "a simple scene")
 
-        # Strong prompt engineered for FLUX to produce B&W hand-drawn output
         prompt = (
             f"black and white pencil sketch of {base_prompt}, "
             "hand drawn illustration, monochrome ink line art, "
             "sketchy rough style, white background, no color whatsoever, "
             "no shading, simple childlike doodle, pencil strokes visible"
         )
+
+        if state.get("is_bye"):
+            # For bye player: generate AI completion of their own half
+            half = state.get("half")
+            print(f"[AI] bye player {pid} — generating AI completion from their own half")
+        else:
+            half = state.get("half")
 
         print(f"[AI] generating for {pid}, prompt: {prompt[:80]}...")
         ai = await inpaint(half, prompt)
@@ -271,22 +333,32 @@ async def try_broadcast_results(lobby_id: str):
     votes = lobby.get("votes", {})
     pair_state = lobby["pair_state"]
 
-    # Check every player has voted (one vote entry per target, total votes = num players)
+    # Count voting players: bye player votes on a special AI-vs-AI card (target = bye_id),
+    # all others vote on their own pair. Every player casts exactly one vote.
     total_votes = sum(v["A"] + v["B"] for v in votes.values())
     if total_votes < len(players):
         return
 
-    # Build per-player result: did the majority correctly identify human vs AI?
     results = []
     for pid, state in pair_state.items():
         target_votes = votes.get(pid, {"A": 0, "B": 0})
         human_img = state.get("human")
         ai_img = state.get("ai")
+        human_is_A = state.get("human_is_A")
 
-        # We need to know which option (A or B) was the human drawing
-        # The server randomised options in start_round3 and didn't store the mapping,
-        # so re-derive it: store human_is_A flag in pair_state during round3 setup
-        human_is_A = state.get("human_is_A")  # set in start_round3 below
+        if state.get("is_bye"):
+            # Bye player: both options were AI — just show the result as informational
+            results.append({
+                "target": pid,
+                "human_votes": target_votes["A"],
+                "ai_votes": target_votes["B"],
+                "humans_fooled": False,
+                "human_img": None,
+                "ai_img": ai_img,
+                "is_bye": True,
+            })
+            continue
+
         if human_is_A is None:
             continue
 
@@ -301,6 +373,7 @@ async def try_broadcast_results(lobby_id: str):
             "humans_fooled": humans_fooled,
             "human_img": human_img,
             "ai_img": ai_img,
+            "is_bye": False,
         })
 
     for p in players:
@@ -317,13 +390,44 @@ async def start_round3(lobby_id: str):
 
     for p in lobby["players"]:
         pid = p["id"]
-        human = lobby["pair_state"][pid].get("human")
-        ai = lobby["pair_state"][pid].get("ai")
+        state = lobby["pair_state"][pid]
+
+        if state.get("is_bye"):
+            # Bye player votes on two AI images (their own AI + a second AI generation)
+            # Use the AI image twice as a placeholder — or generate a second one for fun
+            ai_img = state.get("ai")
+
+            # Generate a second distinct AI image for them to compare against
+            base_prompt = state.get("prompt", "a simple scene")
+            prompt2 = (
+                f"black and white pencil sketch of {base_prompt}, "
+                "hand drawn illustration, monochrome ink line art, simple childlike doodle"
+            )
+            print(f"[round3] bye player {pid}: generating second AI image for voting")
+            ai_img2 = await inpaint(state.get("half"), prompt2)
+
+            options = [ai_img, ai_img2 or ai_img]
+            random.shuffle(options)
+            # human_is_A is meaningless for bye, but set it so results math doesn't crash
+            state["human_is_A"] = False
+
+            await p["ws"].send_json({
+                "type": "round3",
+                "A": options[0],
+                "B": options[1],
+                "target": pid,
+                "is_bye": True,
+                "bye_prompt": "Which AI drawing do you prefer? (You were the odd one out this round)",
+            })
+            continue
+
+        human = state.get("human")
+        ai = state.get("ai")
 
         print(f"[round3] {pid}: human={bool(human)} ai={bool(ai)}")
 
         if not ai:
-            partner_id = lobby["pair_state"][pid].get("partner")
+            partner_id = state.get("partner")
             ai = lobby["pair_state"].get(partner_id, {}).get("human")
             print(f"[round3] {pid}: AI was None, falling back to partner's drawing")
 
@@ -334,11 +438,12 @@ async def start_round3(lobby_id: str):
         options = [human, ai]
         random.shuffle(options)
         human_is_A = options[0] is human
-        lobby["pair_state"][pid]["human_is_A"] = human_is_A
+        state["human_is_A"] = human_is_A
 
         await p["ws"].send_json({
             "type": "round3",
             "A": options[0],
             "B": options[1],
-            "target": pid
+            "target": pid,
+            "is_bye": False,
         })
