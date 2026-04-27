@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-const WS_BASE = "wss://split-draw-v9wv.vercel.app/ws";
-const API_BASE = "https://split-draw-v9wv.vercel.app"
+const WS_BASE = "wss://split-draw-1.onrender.com/ws";
+const API_BASE = "https://split-draw-1.onrender.com"; // FIX 1: removed trailing slash
 
 const ROUND_TIME = 60;
 
@@ -39,6 +39,8 @@ export default function App() {
     };
 
     ws.onerror = () => setError("Connection failed");
+    // FIX 3: handle silent disconnects
+    ws.onclose = () => setError("Disconnected — refresh to reconnect");
   }, []);
 
   async function createLobby() {
@@ -153,6 +155,16 @@ function Round1Screen({ gameState, sendWs }) {
     ctx.fillText("← draw your half here", canvas.width / 4, 24);
   }, []);
 
+  // FIX 2: wrap in useCallback so timer effect gets a stable reference
+  const handleSubmit = useCallback(() => {
+    if (submitted) return;
+    setSubmitted(true);
+    const canvas = canvasRef.current;
+    const dataUrl = canvas.toDataURL("image/png");
+    const base64 = dataUrl.split(",")[1];
+    sendWs({ type: "half_draw", image: base64 });
+  }, [submitted, sendWs]);
+
   useEffect(() => {
     if (submitted) return;
     const t = setInterval(() => {
@@ -162,7 +174,7 @@ function Round1Screen({ gameState, sendWs }) {
       });
     }, 1000);
     return () => clearInterval(t);
-  }, [submitted]);
+  }, [submitted, handleSubmit]);
 
   function getPos(e, canvas) {
     const rect = canvas.getBoundingClientRect();
@@ -198,15 +210,6 @@ function Round1Screen({ gameState, sendWs }) {
   }
 
   function stopDraw() { setDrawing(false); }
-
-  function handleSubmit() {
-    if (submitted) return;
-    setSubmitted(true);
-    const canvas = canvasRef.current;
-    const dataUrl = canvas.toDataURL("image/png");
-    const base64 = dataUrl.split(",")[1];
-    sendWs({ type: "half_draw", image: base64 });
-  }
 
   function clearCanvas() {
     const canvas = canvasRef.current;
@@ -320,6 +323,16 @@ function Round2Screen({ gameState, sendWs }) {
     }
   }, [gameState?.partnerHalf]);
 
+  // FIX 2: wrap in useCallback so timer effect gets a stable reference
+  const handleSubmit = useCallback(() => {
+    if (submitted) return;
+    setSubmitted(true);
+    const canvas = canvasRef.current;
+    const dataUrl = canvas.toDataURL("image/png");
+    const base64 = dataUrl.split(",")[1];
+    sendWs({ type: "completion", image: base64 });
+  }, [submitted, sendWs]);
+
   useEffect(() => {
     if (submitted) return;
     const t = setInterval(() => {
@@ -329,7 +342,7 @@ function Round2Screen({ gameState, sendWs }) {
       });
     }, 1000);
     return () => clearInterval(t);
-  }, [submitted]);
+  }, [submitted, handleSubmit]);
 
   function getPos(e, canvas) {
     const rect = canvas.getBoundingClientRect();
@@ -365,15 +378,6 @@ function Round2Screen({ gameState, sendWs }) {
   }
 
   function stopDraw() { setDrawing(false); }
-
-  function handleSubmit() {
-    if (submitted) return;
-    setSubmitted(true);
-    const canvas = canvasRef.current;
-    const dataUrl = canvas.toDataURL("image/png");
-    const base64 = dataUrl.split(",")[1];
-    sendWs({ type: "completion", image: base64 });
-  }
 
   const timerColor = timeLeft < 10 ? "#e63946" : timeLeft < 20 ? "#f4a261" : "#2a9d8f";
 

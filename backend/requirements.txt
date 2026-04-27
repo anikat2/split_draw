@@ -1,3 +1,4 @@
-fastapi[standard]
-httpx[standard]
-python-dotenv[standard]
+fastapi
+uvicorn
+httpx
+python-dotenv
